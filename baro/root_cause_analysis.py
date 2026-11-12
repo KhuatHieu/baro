@@ -1,7 +1,48 @@
+import numpy as np
 import pandas as pd
 from sklearn.preprocessing import RobustScaler, StandardScaler
 
 from .utility import drop_time, drop_constant, drop_near_constant
+
+# RobustScorer versions (see FINDINGS.md). "1" is BARO as published and stays the default,
+# so the paper's results reproduce. "2" fixes two scoring effects found on RCAEval RE2-OB:
+#   - a series constant before the inject time was dropped (DataFrame path: the two halves
+#     were preprocessed apart, then intersected), however much it moved after it;
+#   - a zero IQR before the inject time gave a scale of 1, so the score was in raw units
+#     (a bursty disk-I/O series in bytes outranked everything).
+SCORER_VERSION = "1"
+SCORER_VERSIONS = ("1", "2")
+
+
+def _check_version(version):
+    if version not in SCORER_VERSIONS:
+        raise ValueError(f"unknown scorer version {version!r}; choose one of {', '.join(SCORER_VERSIONS)}")
+
+
+def robust_score(normal, anomal, window, flat_fraction=0.01):
+    """How far anomal rises above normal, in robust units (scorer version 2).
+
+    BARO's score, max((anomal - median(normal)) / IQR(normal)), with a fallback for an IQR
+    of zero: the standard deviation of normal, and for a series flat before the inject time
+    flat_fraction of its range over the window, so a step away from a flat baseline scores
+    about 1 / flat_fraction (100) whatever its units.
+    """
+    normal, anomal, window = (np.asarray(x, dtype=float) for x in (normal, anomal, window))
+    normal, anomal, window = (x[~np.isnan(x)] for x in (normal, anomal, window))
+    if not len(normal) or not len(anomal):
+        return 0.0
+    # a scale this small is rounding error (the IQR of a constant comes out as ~1e-18)
+    tiny = 1e-9 * max(float(np.max(np.abs(window))), np.finfo(float).tiny)
+    median = np.median(normal)
+    q1, q3 = np.percentile(normal, [25, 75])
+    scale = q3 - q1
+    if scale <= tiny:
+        scale = np.std(normal)
+    if scale <= tiny:
+        scale = flat_fraction * (np.max(window) - np.min(window))
+    if scale <= tiny:
+        return 0.0
+    return float((np.max(anomal) - median) / scale)
 
 
 def select_useful_cols(data):
@@ -185,7 +226,7 @@ def nsigma(data, inject_time=None, dataset=None, num_loop=None, sli=None, anomal
     }
 
 
-def robust_scorer_dict(metrics: dict, inject_time: int) -> list:
+def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VERSION) -> list:
     """Fast RobustScorer for RCAEval JSON metrics format.
 
     Directly processes metrics dict without DataFrame conversion.
@@ -198,10 +239,16 @@ def robust_scorer_dict(metrics: dict, inject_time: int) -> list:
     - inject_time : int
         Unix timestamp of fault injection.
 
+    - version : str
+        Scorer version. "1": |max(post) - median| / IQR, with IQR 0 replaced by 1 (raw units).
+        "2": robust_score (rises only, as in the DataFrame path; no raw-unit fallback);
+        series constant over the whole window are skipped.
+
     Returns:
     - list
         List of (metric_name, score) tuples, sorted descending by score.
     """
+    _check_version(version)
     ranked_list = []
 
     for metric_name, metric_data in metrics.items():
@@ -211,6 +258,13 @@ def robust_scorer_dict(metrics: dict, inject_time: int) -> list:
 
         # Skip metrics with insufficient pre-fault data or no post-fault data
         if len(pre_data) < 4 or not post_data:
+            continue
+
+        if version == "2":
+            window = np.array(pre_data + post_data)
+            if np.isnan(window).all() or np.nanmin(window) == np.nanmax(window):
+                continue
+            ranked_list.append((metric_name, robust_score(pre_data, post_data, window)))
             continue
 
         # Calculate median and IQR from pre-fault data
@@ -235,7 +289,8 @@ def robust_scorer_dict(metrics: dict, inject_time: int) -> list:
 
 
 def robust_scorer(
-    data, inject_time=None, dataset=None, num_loop=None, sli=None, anomalies=None, **kwargs
+    data, inject_time=None, dataset=None, num_loop=None, sli=None, anomalies=None,
+    version=SCORER_VERSION, **kwargs
 ):
     """Perform root cause analysis using RobustScorer.
 
@@ -258,6 +313,8 @@ def robust_scorer(
         SLI (Service Level Indicator). Default is None. Just for future API compatible
     - anomalies : list, optional
         List of anomalies. Default is None. Only used for DataFrame input.
+    - version : str, optional
+        Scorer version, "1" (default, as published) or "2" (see SCORER_VERSION).
     - kwargs : dict
         Additional keyword arguments.
 
@@ -266,15 +323,16 @@ def robust_scorer(
         A dictionary containing:
         - node_names: list of metric names
         - ranks: ranked list of root causes (metric names only)
-        - scores: list of (metric_name, score) tuples (only for dict input)
+        - scores: list of (metric_name, score) tuples (dict input, and DataFrame input with version "2")
     """
+    _check_version(version)
     # Auto-detect input format
     if isinstance(data, dict):
         # Fast path for JSON metrics (RCAEval format)
         if inject_time is None:
             raise ValueError("inject_time is required for dict input")
 
-        ranked = robust_scorer_dict(data, inject_time)
+        ranked = robust_scorer_dict(data, inject_time, version=version)
         return {
             "node_names": list(data.keys()),
             "ranks": [m for m, _ in ranked],
@@ -289,6 +347,25 @@ def robust_scorer(
         normal_df = data.head(anomalies[0])
         # anomal_df is the rest
         anomal_df = data.tail(len(data) - anomalies[0])
+
+    if version == "2":
+        # preprocess the whole window once, so a series is dropped only if it is constant
+        # throughout, not when it is constant before the inject time
+        n_normal = len(normal_df)
+        values = preprocess(
+            data=pd.concat([normal_df, anomal_df]), dataset=dataset,
+            dk_select_useful=kwargs.get("dk_select_useful", False),
+        )
+        scored = []
+        for col in values.columns:
+            v = values[col].to_numpy(dtype=float)
+            scored.append((col, robust_score(v[:n_normal], v[n_normal:], v)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return {
+            "node_names": values.columns.to_list(),
+            "ranks": [c for c, _ in scored],
+            "scores": scored,
+        }
 
     normal_df = preprocess(
         data=normal_df, dataset=dataset, dk_select_useful=kwargs.get("dk_select_useful", False)

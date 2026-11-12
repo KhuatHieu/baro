@@ -79,7 +79,7 @@ def result_exists(output_dir: Path, dataset_id: str, method: str) -> bool:
     return result_file.exists()
 
 
-def run_baro(metrics: Dict, inject_time: int) -> List[tuple]:
+def run_baro(metrics: Dict, inject_time: int, version: str = "1") -> List[tuple]:
     """Run BARO RobustScorer on metrics dict.
 
     Args:
@@ -89,8 +89,13 @@ def run_baro(metrics: Dict, inject_time: int) -> List[tuple]:
     Returns:
         List of (metric_name, score) tuples, sorted descending by score.
     """
-    result = robust_scorer(metrics, inject_time=inject_time)
+    result = robust_scorer(metrics, inject_time=inject_time, version=version)
     return result.get("scores", [])
+
+
+def run_baro_v2(metrics: Dict, inject_time: int) -> List[tuple]:
+    """BARO with RobustScorer version 2 (see FINDINGS.md)."""
+    return run_baro(metrics, inject_time, version="2")
 
 
 def run_nsigma(metrics: Dict, inject_time: int) -> List[tuple]:
@@ -134,6 +139,7 @@ def run_nsigma(metrics: Dict, inject_time: int) -> List[tuple]:
 
 AVAILABLE_METHODS = {
     "baro": run_baro,
+    "baro_v2": run_baro_v2,
     "nsigma": run_nsigma,
 }
 

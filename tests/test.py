@@ -9,7 +9,7 @@ import pytest
 import tempfile
 
 from baro.anomaly_detection import nsigma, bocpd
-from baro.root_cause_analysis import robust_scorer
+from baro.root_cause_analysis import SCORER_VERSION, robust_score, robust_scorer, robust_scorer_dict
 from baro.utility import (
     visualize_metrics,
     download_data,
@@ -477,3 +477,60 @@ def test_end_to_end_missing_normal_period():
     # Verify the system provides meaningful output for operational use
     assert len(result['node_names']) > 0, "Should identify available metrics for analysis"
     
+
+# --- RobustScorer version 2 (FINDINGS.md, F1) ---
+
+def _flat_before_df(n=100, inject=50):
+    """cart_cpu rises a little (noisy baseline); cart_diskio is 0 before inject, gigabytes after;
+    redis_diskio is bursty (IQR 0) and spikes in bytes."""
+    rng = np.random.default_rng(0)
+    t = np.arange(n)
+    after = t >= inject
+    redis = np.zeros(n)
+    redis[::17] = 1e9
+    return pd.DataFrame({
+        "time": t,
+        "cart_cpu": 1 + 0.1 * rng.standard_normal(n) + 3 * after,
+        "cart_diskio": np.where(after, 5e9, 0.0),
+        "redis_diskio": redis,
+        "front_latency": 10 + rng.standard_normal(n),
+    }), inject
+
+
+def test_robust_score_does_not_score_in_raw_units():
+    assert robust_score([0.0] * 50, [9e9] * 50, [0.0] * 50 + [9e9] * 50) == pytest.approx(100)
+    bursty = [0.0] * 45 + [1e9] * 5  # IQR 0: version 1 would score 2e9 here
+    assert robust_score(bursty, [2e9] * 50, bursty + [2e9] * 50) == pytest.approx(2e9 / np.std(bursty))
+    assert robust_score([1, 2, 3, 4, 5], [9], [1, 2, 3, 4, 5, 9]) == pytest.approx((9 - 3) / 2)  # BARO's z-score
+    assert robust_score([4] * 5, [4] * 5, [4] * 10) == 0.0
+    assert robust_score([np.nan] * 5, [1.0], [np.nan] * 5 + [1.0]) == 0.0
+
+
+def test_scorer_version_1_stays_the_default():
+    assert SCORER_VERSION == "1"
+    df, inject = _flat_before_df()
+    assert robust_scorer(df, inject_time=inject)["ranks"] == robust_scorer(df, inject_time=inject, version="1")["ranks"]
+    with pytest.raises(ValueError):
+        robust_scorer(df, inject_time=inject, version="9")
+
+
+def test_scorer_version_2_keeps_series_flat_before_the_inject_time():
+    df, inject = _flat_before_df()
+    v1 = robust_scorer(df, inject_time=inject)["ranks"]
+    assert "cart_diskio" not in v1  # constant in the normal half, so dropped
+    assert v1[0] == "redis_diskio"  # scored in bytes
+    v2 = robust_scorer(df, inject_time=inject, version="2")
+    assert set(v2["ranks"][:2]) == {"cart_diskio", "cart_cpu"}
+    assert all(score < 1e3 for _, score in v2["scores"])
+
+
+def test_scorer_dict_version_2():
+    df, inject = _flat_before_df()
+    metrics = {c: [[int(t), float(v)] for t, v in zip(df["time"], df[c])] for c in df.columns if c != "time"}
+    metrics["const"] = [[t, 3.0] for t in range(100)]
+    v1 = [m for m, _ in robust_scorer_dict(metrics, inject)]
+    assert v1[0] in ("cart_diskio", "redis_diskio")  # raw units: bytes win
+    v2 = robust_scorer_dict(metrics, inject, version="2")
+    assert {m for m, _ in v2[:2]} == {"cart_diskio", "cart_cpu"}
+    assert "const" not in [m for m, _ in v2]
+    assert robust_scorer(metrics, inject_time=inject, version="2")["ranks"] == [m for m, _ in v2]
