@@ -98,6 +98,11 @@ def run_baro_v2(metrics: Dict, inject_time: int) -> List[tuple]:
     return run_baro(metrics, inject_time, version="2")
 
 
+def run_baro_v3(metrics: Dict, inject_time: int) -> List[tuple]:
+    """BARO with RobustScorer version 3 (experimental, see FINDINGS.md F2)."""
+    return run_baro(metrics, inject_time, version="3")
+
+
 def run_nsigma(metrics: Dict, inject_time: int) -> List[tuple]:
     """Run N-Sigma baseline on metrics dict.
 
@@ -140,6 +145,7 @@ def run_nsigma(metrics: Dict, inject_time: int) -> List[tuple]:
 AVAILABLE_METHODS = {
     "baro": run_baro,
     "baro_v2": run_baro_v2,
+    "baro_v3": run_baro_v3,
     "nsigma": run_nsigma,
 }
 

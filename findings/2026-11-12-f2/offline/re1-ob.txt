@@ -1,0 +1,15 @@
+125 case, target = <root>_<indicator>; ind@k / svc@k là số case có hạng <= k
+
+variant                            ind@1  ind@3  ind@5  ind@20  svc@1 svc@3 | ind@1 theo fault: cpu delay disk loss mem
+v1                                     78    103    112    121     92   116 | 21/25 16/25 12/25 10/25 19/25
+v2                                     71     96    109    121     82   112 | 17/25 16/25 10/25 9/25 19/25
+v3                                     78    103    112    121     92   116 | 21/25 16/25 12/25 10/25 19/25
+                                     cờ sustained step: target 0, khác trên service gốc 0, service khác 0
+v3:quiet_rank=score                    71     96    109    121     82   112 | 17/25 16/25 10/25 9/25 19/25
+                                     cờ sustained step: target 0, khác trên service gốc 0, service khác 0
+v3:step_rank=none                      78    103    112    121     92   116 | 21/25 16/25 12/25 10/25 19/25
+                                     cờ sustained step: target 0, khác trên service gốc 0, service khác 0
+v3:baseline=flat                       78    103    112    121     92   116 | 21/25 16/25 12/25 10/25 19/25
+                                     cờ sustained step: target 0, khác trên service gốc 0, service khác 0
+v3:min_rise=0.5                        78    103    112    121     92   116 | 21/25 16/25 12/25 10/25 19/25
+                                     cờ sustained step: target 0, khác trên service gốc 0, service khác 0

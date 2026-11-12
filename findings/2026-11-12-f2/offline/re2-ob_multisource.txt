@@ -1,0 +1,9 @@
+re2-ob logs           v1: svc@1=  2 svc@3= 16 / 90
+re2-ob logs           v2: svc@1=  8 svc@3= 24 / 90
+re2-ob logs           v3: svc@1=  1 svc@3= 11 / 90
+re2-ob trace_errors   v1: svc@1= 12 svc@3= 14 / 90
+re2-ob trace_errors   v2: svc@1= 11 svc@3= 13 / 90
+re2-ob trace_errors   v3: svc@1= 11 svc@3= 13 / 90
+re2-ob trace_latency  v1: svc@1= 29 svc@3= 55 / 90
+re2-ob trace_latency  v2: svc@1= 19 svc@3= 48 / 90
+re2-ob trace_latency  v3: svc@1= 20 svc@3= 32 / 90

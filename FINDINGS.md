@@ -12,6 +12,7 @@ trước/sau, và bằng chứng để tra lại.
 |---|---|---|---|
 | RobustScorer | `1` (mặc định) | BARO như paper. **Có lỗi F1.** Giữ làm mặc định để kết quả paper tái lập được. | `baro/root_cause_analysis.py` |
 | RobustScorer | `2` | Sửa F1: giữ series phẳng trước inject, không chấm theo đơn vị thô. | `baro/root_cause_analysis.py` (`robust_score`) |
+| RobustScorer | `3` (thử nghiệm) | F2: điểm như v2, xếp theo 3 bậc: bước nhảy kéo dài từ nền lặng → z-score → series lặng không có bước nhảy. | `baro/root_cause_analysis.py` (`sustained_step`, `is_quiet`, `rank_scored`) |
 
 Chọn version:
 
@@ -21,7 +22,9 @@ robust_scorer(df, inject_time=t, version="2")       # DataFrame (FSE CSV)
 robust_scorer(metrics, inject_time=t, version="2")  # dict (RCAEval JSON)
 ```
 
-`run_bench.py --methods baro,baro_v2` chạy cả hai trên dữ liệu RCAEval.
+`run_bench.py --methods baro,baro_v2,baro_v3` chạy các phiên bản trên dữ liệu RCAEval.
+Đánh giá offline (không LLM): `scripts/eval_ranking.py` (metrics) và `scripts/eval_multisource.py`
+(logs/traces); cả hai cần RCAEval đã cài và một task view (`rcaeval-agent export`).
 
 ### Bên RCAEval (fork `KhuatHieu/RCAEval`, commit `75c2a21`)
 
@@ -31,10 +34,11 @@ BARO được dùng làm tool `rank_anomalies` của agent LLM. Mỗi prediction
 |---|---|---|---|
 | Toolkit | `1` | `rank_anomalies(metrics)` = BARO y hệt `RCAEval.e2e.baro`. | scorer `1` (ranking khớp 90/90 case RE2-OB) |
 | Toolkit | `2` (mặc định) | Sửa F1, chỉ cho modality metrics. | scorer `2` (score khớp 90/90; xem "Kiểm tra chéo") |
+| Toolkit | `3` (thử nghiệm) | F2, chỉ cho metrics; series có bước nhảy kèm nhãn `step`. Logs/traces như v1. | scorer `3` (ranking khớp 215/215 case RE2-OB + RE1-OB) |
 | Prompt | `2` | Kiểm tra 3-5 nghi phạm bằng bằng chứng riêng, không tin một ranking. | - |
 | Prompt | `nobaro` | Như v2 nhưng bỏ `rank_anomalies`. | - |
 
-Chạy bench agent: `script/bench_llm.sh` trong RCAEval (`ARM=baro|nobaro TOOLKIT_VERSION=1|2 REP=n`).
+Chạy bench agent: `script/bench_llm.sh` trong RCAEval (`ARM=baro|nobaro TOOLKIT_VERSION=1|2|3 REP=n`).
 
 ## Cấu trúc thư mục findings
 
@@ -43,7 +47,11 @@ FINDINGS.md                         # file này
 findings/<ngày>-<dataset>-<mã>/      # bằng chứng của từng finding
   runs/percase_*.jsonl              # kết quả từng case (rcaeval-agent evaluate --per-case-out)
   runs/summary_*.json               # tổng hợp + usage (chi phí, tool call)
-scripts/compare_runs.py             # so sánh các run: bảng theo fault, McNemar, gộp rep
+  offline/<dataset>.txt, .jsonl     # đánh giá offline của các scorer (eval_ranking.py)
+scripts/compare_runs.py             # so sánh các run LLM: bảng theo fault, McNemar, gộp rep
+scripts/eval_ranking.py             # đánh giá offline thứ hạng metric đúng theo scorer
+scripts/eval_multisource.py         # như trên cho logs / trace_latency / trace_errors
+scripts/eval_v3_nolatstep.py        # thử post-hoc: v3 nhưng bậc 1 bỏ series *_latency
 ```
 
 Trajectory và prediction đầy đủ (nặng) nằm ở `RCAEval/results/` (không commit).
@@ -209,6 +217,184 @@ python scripts/compare_runs.py \
   `latency`; cần đọc trajectory.
 - Tham số v2 được chọn trên RE2-OB. Quy ước cho v3: thiết kế trên RE2-OB, kiểm chứng trên RE2-TT
   trước khi đổi mặc định. Service-level đã chạm trần trên RE2-OB.
+
+## F2. Scorer v3: xếp bậc theo loại tín hiệu (2026-11-12; tốt trên RE2-OB, thất bại trên RE2-TT)
+
+**Mục tiêu:** sửa hai điểm còn lại sau F1: (a) fault disk, `<root>_diskio` đứng sau `mem`;
+(b) fault socket gần như luôn sai. Bằng chứng: `findings/2026-11-12-f2/`.
+
+### Quan sát dẫn tới thiết kế
+
+Trên RE2-OB, xét các series phẳng trước inject (v2 cho chúng cùng score ≈ 100):
+
+| Điều kiện | Metric root cause (15 diskio + 15 socket) | Series nhiễu |
+|---|---|---|
+| Khác nền ở ≥ 90% mẫu sau inject | 30/30 | 36/145 |
+| ... và median tăng ≥ 50% so với nền | 30/30 | 21/145 (18 trong số đó trên chính service gốc) |
+
+"Bước nhảy kéo dài từ nền phẳng" là tín hiệu rất đặc hiệu.
+
+### Phát hiện phụ: v2 kém hơn v1 trên RE1-OB
+
+Kiểm chứng trên RE1-OB (125 case, chỉ có metrics) cho thấy **v2 kém v1**: ind@1 78 → 71,
+svc@1 92 → 82. Nguyên nhân là fallback std của v2 khuếch đại các series gần như hằng số:
+
+| Case | Series | std trước inject | thay đổi sau | v2 score | v1 (IQR 0 → scale 1) |
+|---|---|---|---|---|---|
+| re1-ob-0006 | `emailservice_mem` | 0.0006 MB | +0.2 MB | 316 | 0.2 |
+| re1-ob-0096 | `paymentservice_latency` | 1.6e-5 s | +0.012 s | 733 | 0.012 |
+
+v1 "đúng một cách tình cờ": scale = 1 trong đơn vị MB/giây gần như đẩy các series lặng
+(IQR = 0) xuống cuối; nó chỉ sai khi đơn vị lớn (byte của diskio). Kết luận: **z-score chỉ có
+nghĩa khi giai đoạn normal có độ phân tán.**
+
+### Thiết kế v3
+
+Điểm số như v2, xếp theo 3 bậc (`rank_scored`):
+
+1. **Bước nhảy kéo dài** (`sustained_step`): normal lặng (IQR ≈ 0, nền = median, cho phép vài
+   dao động lẻ), khác nền ở ≥ 90% mẫu sau inject, median sau ≥ 2 lần nền (`min_rise=1.0`;
+   tăng từ 0 tính là vô hạn). Trong bậc: rise lớn trước.
+2. Series có độ phân tán trước inject, theo z-score (như BARO).
+3. Series lặng không có bước nhảy, theo score fallback.
+
+Toolkit v3 (RCAEval) gắn thêm nhãn cho bậc 1, vd. `"step": "from 0 to 8.234e+09, held in 96%
+of samples after the inject time"`.
+
+### Đánh giá offline (không LLM)
+
+`offline/re2-ob.txt`, `offline/re1-ob.txt`. ind@k = số case metric đúng có hạng ≤ k.
+
+| Scorer | RE2-OB ind@1 | ind@3 | ind@20 | svc@1 | svc@3 | RE1-OB ind@1 | ind@3 | svc@1 |
+|---|---|---|---|---|---|---|---|---|
+| v1 | 8 | 39 | 57 | 13 | 79 | **78** | **103** | **92** |
+| v2 | 33 | 64 | 90 | **77** | **87** | 71 | 96 | 82 |
+| **v3** | **55** | **82** | **90** | 76 | 85 | **78** | **103** | **92** |
+
+Theo fault (RE2-OB ind@1, v2 → v3): disk 0 → **15/15**, socket 1 → **15/15**, delay 11 → 11,
+cpu 2 → 2, nhưng loss 10 → 6 và mem 9 → 6: `socket` của chính service gốc (triệu chứng đi kèm)
+cũng có bước nhảy và vượt lên metric đúng.
+
+Ablation (RE2-OB ind@1 / RE1-OB ind@1):
+
+| Biến thể | RE2-OB | RE1-OB | Ghi chú |
+|---|---|---|---|
+| v3 (mặc định) | 55 | 78 | |
+| bỏ bậc 3 (`quiet_rank=score`) | 55 | 71 | bậc 3 là thứ khôi phục RE1-OB |
+| bỏ bậc 1 (`step_rank=none`) | 29 | 78 | bậc 1 là thứ sửa disk/socket |
+| nền phẳng tuyệt đối (`baseline=flat`) | 54 (ind@20: 86) | 78 | 4 latency đúng bị đẩy xuống bậc 3 |
+| `min_rise=0.5` | 53 | 78 | thêm 14 cờ nhầm trên service gốc |
+
+**Cảnh báo overfit:** ngưỡng và cách xếp bậc được chọn khi nhìn RE2-OB, và RE1-OB đã được dùng
+để chẩn đoán bậc 3, nên cả hai không còn là tập kiểm chứng độc lập. RE2-TT là tập kiểm chứng
+thật (chưa nhìn).
+
+**Logs/traces (kết quả âm tính):** áp cùng cách xếp bậc cho logs/trace_latency/trace_errors
+làm kém đi (trace_latency svc@3: v1 55, v2 48, v3 32; logs svc@3: v1 16, v2 24, v3 11;
+`offline/re2-ob_multisource.txt`). Toolkit v3 giữ logs/traces như v1.
+
+### Kiểm chứng trên RE2-TT (2026-11-12): **v3 không tổng quát hoá**
+
+RE2-TT (Train Ticket, 90 case, 6 fault × 15) là tập chưa từng nhìn khi thiết kế v3.
+`offline/re2-tt.txt`, `offline/re2-tt.jsonl`.
+
+| Scorer | ind@1 | ind@3 | ind@5 | ind@20 | svc@1 | svc@3 | cpu | delay | disk | loss | mem | socket |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| v1 | **36** | **50** | **57** | **76** | **60** | **74** | 1 | 7 | 15 | 8 | 5 | 0 |
+| v2 | **36** | 47 | 53 | 74 | **60** | 71 | 1 | 7 | 15 | 8 | 5 | 0 |
+| v3 | 18 | 48 | 57 | 75 | 29 | 71 | 1 | 0 | 12 | 3 | 2 | 0 |
+| v3 `step_rank=none` | 36 | 50 | 57 | 75 | 60 | 74 | 1 | 7 | 15 | 8 | 5 | 0 |
+
+(cpu…socket: ind@1, mỗi loại /15.)
+
+**v3 làm svc@1 giảm một nửa (60 → 29).** Bậc 1 gắn cờ 45 series, **0 series là target**:
+
+- `ts-admin-travel-service_latency` bị gắn cờ ở 34/90 case. Trước inject nó đứng yên ở đúng
+  0.235 (IQR ≈ 0, 2 giá trị duy nhất; có lẽ endpoint admin gần như không có request nên giá trị
+  cũ được giữ lại). Sau inject nó dao động (0.4-9.5) ở ≥ 93% mẫu, **ở mọi loại fault**. Đây là
+  artifact của workload chứ không phải tín hiệu fault, nhưng nó thoả đúng định nghĩa "bước nhảy
+  kéo dài từ nền lặng".
+- Phần còn lại: `ts-preserve-service_latency` (7), `ts-preserve-other-service_latency` (2),
+  `ts-inside-payment-service_latency` (2), cùng kiểu.
+
+Thêm vài điểm về RE2-TT:
+- Fault disk đã đúng 15/15 với v1: `diskio` không phẳng trước inject như ở RE2-OB, nên lỗi F1
+  không xuất hiện ở đây. v2 = v1 ở ind@1.
+- Socket bằng 0/15 với mọi version, thứ hạng của target khoảng 5-16 và không bị gắn cờ step:
+  đây là vấn đề khác, không liên quan v3.
+
+**Thử post-hoc (đã nhìn RE2-TT, không còn là kiểm chứng độc lập):** loại series `*_latency`
+khỏi bậc 1 (`scripts/eval_v3_nolatstep.py`, patch `rank_scored`):
+
+| | RE2-TT ind@1 / svc@1 | RE2-OB ind@1 / ind@20 / svc@1 | RE1-OB ind@1 / svc@1 |
+|---|---|---|---|
+| v3 | 18 / 29 | 55 / 90 / 76 | 78 / 92 |
+| v3 bỏ latency khỏi bậc 1 | 36 / 60 | 53 / 86 / 75 | 78 / 92 |
+
+Biến thể này đưa RE2-TT về ngang v1 và giữ gần hết lợi ích trên RE2-OB (mất 4 case latency
+khỏi top-20, giống ablation `baseline=flat`). Tuy vậy nó được chọn sau khi nhìn cả 3 dataset,
+nên **cần một tập kiểm chứng mới** (RE2-SS hoặc RE3-*) trước khi đưa vào code.
+
+**Hệ quả:**
+1. Không đổi mặc định sang v3. Toolkit v3 giữ nhãn "thử nghiệm".
+2. Không bench LLM tk3 trên RE2-TT: bước 2 của "Việc tiếp theo" có điều kiện "nếu RE2-TT giữ
+   được kết quả", và điều kiện này không thoả. Offline đã cho thấy tk3 sẽ đẩy nhiễu lên đầu.
+3. Kết quả bench RE2-OB bên dưới (tk3 > không BARO) chỉ đúng trên dataset dùng để thiết kế v3.
+
+### Bench LLM (RE2-OB, 3 rep mỗi cấu hình)
+
+Hoàn tất 2026-11-12 (đã chạy tiếp từ phần dở; cả 9 run đủ 90/90 case, không trùng case).
+gpt-6-luna, temperature 0, max 30 steps. Bằng chứng: `findings/2026-11-12-f2/runs/` (tk2 r1-r2 và
+nobaro r1-r2 dùng lại file của F1), bảng đầy đủ: `findings/2026-11-12-f2/compare_3rep.txt`.
+
+| Run | svc AC@1 | ind AC@1 | ind AC@3 | ind Avg@5 | cpu | mem | disk | socket | delay | loss | $/case | calls |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tk2 r1 | 89 | 57 | 81 | 0.847 | 11 | 13 | 6 | 1 | 13 | 13 | 0.0026 | 28.9 |
+| tk2 r2 | 89 | 57 | 78 | 0.836 | 12 | 11 | 7 | 1 | 14 | 12 | 0.0026 | 28.7 |
+| tk2 r3 | 89 | 56 | 82 | 0.847 | 12 | 11 | 5 | 2 | 14 | 12 | 0.0026 | 28.5 |
+| **tk3 r1** | 89 | 68 | 88 | 0.927 | 10 | 9 | 15 | 8 | 15 | 11 | 0.0024 | 28.9 |
+| **tk3 r2** | 89 | 64 | 90 | 0.922 | 12 | 7 | 14 | 6 | 14 | 11 | 0.0026 | 29.3 |
+| **tk3 r3** | 90 | 75 | 88 | 0.944 | 12 | 12 | 15 | 8 | 15 | 13 | 0.0025 | 29.5 |
+| không BARO r1 | 90 | 63 | 81 | 0.858 | 14 | 8 | 14 | 2 | 15 | 10 | 0.0042 | 41.9 |
+| không BARO r2 | 90 | 60 | 81 | 0.847 | 12 | 11 | 11 | 1 | 14 | 11 | 0.0041 | 40.8 |
+| không BARO r3 | 90 | 61 | 82 | 0.862 | 13 | 10 | 13 | 1 | 15 | 9 | 0.0041 | 42.4 |
+
+Gộp 3 rep (điểm mỗi case = trung bình 3 run; cpu…loss là số case đúng trung bình /15):
+
+| nhóm | ind AC@1 | ind Avg@5 | cpu | mem | disk | socket | delay | loss |
+|---|---|---|---|---|---|---|---|---|
+| tk2 | 0.630 | 0.843 | 11.7 | 11.7 | 6.0 | 1.3 | 13.7 | 12.3 |
+| **tk3** | **0.767** | **0.931** | 11.3 | 9.3 | **14.7** | **7.3** | 14.7 | 11.7 |
+| không BARO | 0.681 | 0.856 | 13.0 | 9.7 | 12.7 | 1.3 | 14.7 | 10.0 |
+
+| So sánh (A → B) | ind AC@1 (B − A) | p | ind Avg@5 (B − A) | p |
+|---|---|---|---|---|
+| tk2 → tk3 | **+0.137 [+0.052, +0.222]** | **0.004** | **+0.088 [+0.045, +0.133]** | **0.0003** |
+| không BARO → tk3 (dấu đảo từ bảng gốc `tk3:nobaro`) | +0.085 [+0.004, +0.167] | 0.054 | **+0.076 [+0.036, +0.119]** | **0.0009** |
+| tk2 → không BARO | +0.052 [−0.033, +0.137] | 0.28 | +0.013 [−0.036, +0.062] | 0.65 |
+
+**Kết luận:**
+
+1. tk3 cải thiện có ý nghĩa so với tk2 ở cả AC@1 (+0.14) và Avg@5 (+0.09).
+2. **Lần đầu tiên agent có BARO tốt hơn agent không có BARO**: Avg@5 +0.076 (p < 0.001), AC@1
+   +0.085 (p = 0.054, sát ngưỡng), trong khi vẫn rẻ hơn ~40% ($0.0025 so với $0.0041/case) và ít
+   tool call hơn (29 so với 42).
+3. Khớp dự đoán offline: disk 6.0 → 14.7, socket 1.3 → 7.3. Socket chỉ được 7.3/15 trong khi
+   offline tk3 đạt 15/15 ở ind@1: agent vẫn hay chọn `latency` dù ranking đã đúng (cần đọc
+   trajectory). Cái giá ở mem (11.7 → 9.3) như dự đoán.
+4. Nhiễu giữa rep vẫn lớn (tk3 ind AC@1: 64-75/90). Tham số v3 được chọn trên RE2-OB, nên kết
+   luận 2 cần kiểm chứng trên RE2-TT. **Offline trên RE2-TT, v3 thất bại** (xem mục trên), nên
+   kết luận 2 chưa tổng quát hoá được.
+
+### Việc tiếp theo
+
+1. ~~Hoàn tất bench RE2-OB~~ (xong). ~~Kiểm chứng RE2-TT offline~~ (xong: v3 thất bại).
+2. Tìm định nghĩa bậc 1 không bắt artifact workload. Ứng viên: chỉ metric tài nguyên (bỏ
+   latency), xem bảng post-hoc ở trên. Kiểm chứng trên một dataset chưa nhìn (RE2-SS, RE3-*)
+   trước khi đưa vào code; chỉ bench LLM trên RE2-TT nếu biến thể mới qua được bước này.
+3. Socket: RE2-OB agent chỉ đúng 7.3/15 dù ranking đúng; RE2-TT ranking sai ở mọi version.
+   Cần đọc trajectory / xem dữ liệu socket của Train Ticket.
+4. Cái giá ở cpu/mem trên RE2-OB: `socket` của service gốc vượt lên metric đúng.
 
 ---
 

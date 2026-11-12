@@ -10,8 +10,13 @@ from .utility import drop_time, drop_constant, drop_near_constant
 #     were preprocessed apart, then intersected), however much it moved after it;
 #   - a zero IQR before the inject time gave a scale of 1, so the score was in raw units
 #     (a bursty disk-I/O series in bytes outranked everything).
+# "3" (experimental, FINDINGS.md F2) scores as "2" and ranks in tiers (rank_scored): a
+#     sustained step up from a quiet baseline first, then series whose normal period has spread
+#     by z-score, then quiet series without a step (whose z-score is not meaningful).
 SCORER_VERSION = "1"
-SCORER_VERSIONS = ("1", "2")
+SCORER_VERSIONS = ("1", "2", "3")
+STEP_RANKS = ("tier", "none")
+QUIET_RANKS = ("last", "score")
 
 
 def _check_version(version):
@@ -43,6 +48,75 @@ def robust_score(normal, anomal, window, flat_fraction=0.01):
     if scale <= tiny:
         return 0.0
     return float((np.max(anomal) - median) / scale)
+
+
+def sustained_step(normal, anomal, min_persistence=0.9, min_rise=1.0, baseline="quiet"):
+    """A step up from a flat baseline that holds after the inject time (scorer version 3).
+
+    Returns {"persistence", "rise"} when normal has a baseline (baseline "quiet": no
+    interquartile spread, baseline = its median, so a few blips are allowed; "flat": strictly
+    constant), the series differs from that baseline in at least min_persistence of the
+    anomalous samples, and its anomalous median is
+    at least min_rise above the baseline (relative, so 1.0 = at least doubled; any rise from a
+    zero baseline counts, as rise = inf). Otherwise None. On RE2-OB the defaults flag the root
+    cause's disk I/O and socket count in every disk and socket fault (smallest rise there: 1.44)
+    and 7 other series in 90 cases, 6 of them on the root-cause service (FINDINGS.md F2).
+    """
+    normal, anomal = (np.asarray(x, dtype=float) for x in (normal, anomal))
+    normal, anomal = normal[~np.isnan(normal)], anomal[~np.isnan(anomal)]
+    if not len(normal) or not len(anomal):
+        return None
+    if baseline == "flat":
+        if np.ptp(normal) > 0:
+            return None
+        base = normal[0]
+    else:  # "quiet": no interquartile spread; a few blips before the inject time are allowed
+        if not is_quiet(normal):
+            return None
+        base = float(np.median(normal))
+    tol = 1e-9 * max(abs(base), float(np.max(np.abs(anomal))), np.finfo(float).tiny)
+    persistence = float(np.mean(np.abs(anomal - base) > tol))
+    median = float(np.median(anomal))
+    if median - base <= tol:
+        return None
+    rise = float("inf") if abs(base) <= tol else (median - base) / abs(base)
+    if persistence < min_persistence or rise < min_rise:
+        return None
+    return {"persistence": round(persistence, 3), "rise": rise}
+
+
+def is_quiet(normal):
+    """True when normal has (almost) no interquartile spread, so a z-score against it is not
+    meaningful: robust_score then falls back to the standard deviation or the window range."""
+    normal = np.asarray(normal, dtype=float)
+    normal = normal[~np.isnan(normal)]
+    if not len(normal):
+        return True
+    q1, q3 = np.percentile(normal, [25, 75])
+    return q3 - q1 <= 1e-9 * max(float(np.max(np.abs(normal))), np.finfo(float).tiny)
+
+
+def rank_scored(scored, steps, step_rank="tier", quiet=(), quiet_rank="last"):
+    """Order (name, score) pairs (scorer version 3), in tiers:
+    1. with step_rank "tier", series with a sustained step (largest rise first);
+    2. series whose normal period has spread, by score (BARO's z-score);
+    3. with quiet_rank "last", quiet series (is_quiet) without a step, by their fallback score.
+    step_rank "none" and quiet_rank "score" turn tiers 1 and 3 off."""
+    if step_rank not in STEP_RANKS:
+        raise ValueError(f"unknown step_rank {step_rank!r}; choose one of {', '.join(STEP_RANKS)}")
+    if quiet_rank not in QUIET_RANKS:
+        raise ValueError(f"unknown quiet_rank {quiet_rank!r}; choose one of {', '.join(QUIET_RANKS)}")
+    quiet = set(quiet)
+
+    def key(item):
+        name, score = item
+        if step_rank == "tier" and name in steps:
+            return (2, steps[name]["rise"], score)
+        if quiet_rank == "last" and name in quiet:
+            return (0, 0, score)
+        return (1, 0, score)
+
+    return sorted(scored, key=key, reverse=True)
 
 
 def select_useful_cols(data):
@@ -226,7 +300,8 @@ def nsigma(data, inject_time=None, dataset=None, num_loop=None, sli=None, anomal
     }
 
 
-def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VERSION) -> list:
+def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VERSION,
+                       step_rank: str = "tier", steps: dict = None, quiet_rank: str = "last") -> list:
     """Fast RobustScorer for RCAEval JSON metrics format.
 
     Directly processes metrics dict without DataFrame conversion.
@@ -243,6 +318,8 @@ def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VE
         Scorer version. "1": |max(post) - median| / IQR, with IQR 0 replaced by 1 (raw units).
         "2": robust_score (rises only, as in the DataFrame path; no raw-unit fallback);
         series constant over the whole window are skipped.
+        "3": as "2", ordered by rank_scored(step_rank, quiet_rank); flagged series go into
+        `steps` if given.
 
     Returns:
     - list
@@ -250,6 +327,8 @@ def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VE
     """
     _check_version(version)
     ranked_list = []
+    found = {} if steps is None else steps
+    quiet = set()
 
     for metric_name, metric_data in metrics.items():
         # Split by inject_time
@@ -260,11 +339,17 @@ def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VE
         if len(pre_data) < 4 or not post_data:
             continue
 
-        if version == "2":
+        if version in ("2", "3"):
             window = np.array(pre_data + post_data)
             if np.isnan(window).all() or np.nanmin(window) == np.nanmax(window):
                 continue
             ranked_list.append((metric_name, robust_score(pre_data, post_data, window)))
+            if version == "3":
+                step = sustained_step(pre_data, post_data)
+                if step:
+                    found[metric_name] = step
+                if is_quiet(pre_data):
+                    quiet.add(metric_name)
             continue
 
         # Calculate median and IQR from pre-fault data
@@ -284,6 +369,8 @@ def robust_scorer_dict(metrics: dict, inject_time: int, version: str = SCORER_VE
         score = abs(max_val - median) / iqr
         ranked_list.append((metric_name, score))
 
+    if version == "3":
+        return rank_scored(ranked_list, found, step_rank, quiet, quiet_rank)
     ranked_list.sort(key=lambda x: x[1], reverse=True)
     return ranked_list
 
@@ -314,7 +401,9 @@ def robust_scorer(
     - anomalies : list, optional
         List of anomalies. Default is None. Only used for DataFrame input.
     - version : str, optional
-        Scorer version, "1" (default, as published) or "2" (see SCORER_VERSION).
+        Scorer version, "1" (default, as published), "2" or "3" (see SCORER_VERSION).
+        Version "3" also takes step_rank ("tier" or "none"), quiet_rank ("last" or "score"),
+        min_persistence and min_rise (see sustained_step), and returns "steps".
     - kwargs : dict
         Additional keyword arguments.
 
@@ -332,12 +421,18 @@ def robust_scorer(
         if inject_time is None:
             raise ValueError("inject_time is required for dict input")
 
-        ranked = robust_scorer_dict(data, inject_time, version=version)
-        return {
+        steps = {}
+        ranked = robust_scorer_dict(data, inject_time, version=version,
+                                    step_rank=kwargs.get("step_rank", "tier"), steps=steps,
+                                    quiet_rank=kwargs.get("quiet_rank", "last"))
+        result = {
             "node_names": list(data.keys()),
             "ranks": [m for m, _ in ranked],
             "scores": ranked,
         }
+        if version == "3":
+            result["steps"] = steps
+        return result
 
     # Existing DataFrame path (FSE format)
     if anomalies is None:
@@ -348,7 +443,7 @@ def robust_scorer(
         # anomal_df is the rest
         anomal_df = data.tail(len(data) - anomalies[0])
 
-    if version == "2":
+    if version in ("2", "3"):
         # preprocess the whole window once, so a series is dropped only if it is constant
         # throughout, not when it is constant before the inject time
         n_normal = len(normal_df)
@@ -356,16 +451,30 @@ def robust_scorer(
             data=pd.concat([normal_df, anomal_df]), dataset=dataset,
             dk_select_useful=kwargs.get("dk_select_useful", False),
         )
-        scored = []
+        scored, steps, quiet = [], {}, set()
         for col in values.columns:
             v = values[col].to_numpy(dtype=float)
             scored.append((col, robust_score(v[:n_normal], v[n_normal:], v)))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return {
+            if version == "3":
+                step = sustained_step(v[:n_normal], v[n_normal:], **{
+                    k: kwargs[k] for k in ("min_persistence", "min_rise", "baseline") if k in kwargs})
+                if step:
+                    steps[col] = step
+                if is_quiet(v[:n_normal]):
+                    quiet.add(col)
+        if version == "3":
+            scored = rank_scored(scored, steps, kwargs.get("step_rank", "tier"), quiet,
+                                 kwargs.get("quiet_rank", "last"))
+        else:
+            scored.sort(key=lambda x: x[1], reverse=True)
+        result = {
             "node_names": values.columns.to_list(),
             "ranks": [c for c, _ in scored],
             "scores": scored,
         }
+        if version == "3":
+            result["steps"] = steps
+        return result
 
     normal_df = preprocess(
         data=normal_df, dataset=dataset, dk_select_useful=kwargs.get("dk_select_useful", False)

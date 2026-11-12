@@ -9,7 +9,7 @@ import pytest
 import tempfile
 
 from baro.anomaly_detection import nsigma, bocpd
-from baro.root_cause_analysis import SCORER_VERSION, robust_score, robust_scorer, robust_scorer_dict
+from baro.root_cause_analysis import SCORER_VERSION, robust_score, robust_scorer, robust_scorer_dict, sustained_step
 from baro.utility import (
     visualize_metrics,
     download_data,
@@ -534,3 +534,30 @@ def test_scorer_dict_version_2():
     assert {m for m, _ in v2[:2]} == {"cart_diskio", "cart_cpu"}
     assert "const" not in [m for m, _ in v2]
     assert robust_scorer(metrics, inject_time=inject, version="2")["ranks"] == [m for m, _ in v2]
+
+
+# --- RobustScorer version 3 (FINDINGS.md, F2) ---
+
+def test_sustained_step():
+    assert sustained_step([0.0] * 10, [5e9] * 10)["rise"] == float("inf")
+    assert sustained_step([4.0] * 10, [17.0] * 10) == {"persistence": 1.0, "rise": pytest.approx(13 / 4)}
+    assert sustained_step([3.0] * 10, [4.0] * 10) is None  # +33%: below min_rise
+    assert sustained_step([0.0] * 10, [0.0] * 8 + [9.0] * 2) is None  # a blip, not sustained
+    assert sustained_step([1.0, 2.0] * 5, [9.0] * 10) is None  # not flat before
+    assert sustained_step([5.0] * 10, [1.0] * 10) is None  # a drop
+
+
+def test_scorer_version_3_ranks_a_sustained_step_first():
+    df, inject = _flat_before_df()
+    df["cart_mem"] = 40 + 0.01 * np.arange(100) + np.where(df["time"] >= inject, 200, 0)  # z-score in the thousands
+    v2 = robust_scorer(df, inject_time=inject, version="2")["ranks"]
+    assert v2[0] == "cart_mem"
+    v3 = robust_scorer(df, inject_time=inject, version="3")
+    assert v3["ranks"][0] == "cart_diskio" and set(v3["steps"]) == {"cart_diskio"}
+    assert robust_scorer(df, inject_time=inject, version="3", step_rank="none", quiet_rank="score")["ranks"] == v2
+    # quiet series (no spread before the inject time) without a step go last: redis_diskio here
+    assert v3["ranks"][-1] == "redis_diskio"
+    no_step = robust_scorer(df, inject_time=inject, version="3", step_rank="none")["ranks"]
+    assert set(no_step[-2:]) == {"cart_diskio", "redis_diskio"}
+    metrics = {c: [[int(t), float(v)] for t, v in zip(df["time"], df[c])] for c in df.columns if c != "time"}
+    assert robust_scorer(metrics, inject_time=inject, version="3")["ranks"][0] == "cart_diskio"
